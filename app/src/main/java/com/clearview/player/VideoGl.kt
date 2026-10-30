@@ -1,5 +1,6 @@
 package com.clearview.player
 
+import android.content.Context
 import android.graphics.SurfaceTexture
 import android.opengl.EGL14
 import android.opengl.EGLConfig
@@ -28,7 +29,7 @@ import kotlin.math.roundToInt
  * The AI step sees the real video frame, not a screenshot, so it works on the actual source detail.
  * Everything runs on one GL thread; the public methods are safe to call from any thread.
  */
-class VideoGl(private val outSurface: Surface) {
+class VideoGl(private val outSurface: Surface, private val ctx: Context) {
 
     private val thread = HandlerThread("gl-video").apply { start() }
     private val handler = Handler(thread.looper)
@@ -276,7 +277,7 @@ class VideoGl(private val outSurface: Surface) {
                 ai?.release(); ai = null
                 upscaler?.close(); upscaler = null
                 AiSettings.status = "AI: loading model on the NPU..."
-                val up = NpuUpscaler(path, AiSettings.nativeLibDir, AiSettings.allowCpu)
+                val up = NpuUpscaler(path, AiSettings.nativeLibDir, ctx.cacheDir.absolutePath, AiSettings.allowCpu)
                 upscaler = up
                 upscalerPath = path
                 AiSettings.status = "AI running: " + up.describe()

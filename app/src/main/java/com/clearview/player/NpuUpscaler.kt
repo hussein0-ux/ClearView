@@ -23,7 +23,7 @@ import java.nio.FloatBuffer
  *    Use [inferU8] for those: feed raw 0..255 pixels mapped through [inLut], and dequantise the output with
  *    `(q - outZero) * outScale`.
  */
-class NpuUpscaler(modelPath: String, nativeLibDir: String, allowCpu: Boolean = false) : AutoCloseable {
+class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, allowCpu: Boolean = false) : AutoCloseable {
 
     private companion object {
         const val MAX_ATTEMPTS = 4
@@ -89,6 +89,8 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, allowCpu: Boolean = f
                         "backend_path" to "libQnnHtp.so",
                         "htp_performance_mode" to "burst",
                         "enable_htp_fp16_precision" to "1",
+                        "qnn_context_cache_enable" to "1",
+                        "qnn_context_cache_path" to "$cacheDir/model_cache.bin"
                     )
                 )
                 if (!allowCpu) o.addConfigEntry("session.disable_cpu_ep_fallback", "1")

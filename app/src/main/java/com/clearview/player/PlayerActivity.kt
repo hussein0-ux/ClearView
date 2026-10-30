@@ -73,7 +73,8 @@ class PlayerActivity : ComponentActivity() {
             }
             if (showStats) {
                 val st = AiSettings.stats
-                statsText.text = AiSettings.status + if (st.isNotEmpty()) "\n$st" else ""
+                statsText.text = AiSettings.status + if (st.isNotEmpty()) "
+$st" else ""
             }
             ui.postDelayed(this, 400)
         }
@@ -120,7 +121,7 @@ class PlayerActivity : ComponentActivity() {
         val surface = SurfaceView(this)
         surface.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
-                val g = VideoGl(holder.surface)
+                val g = VideoGl(holder.surface, this@PlayerActivity)
                 g.start()
                 gl = g
                 player?.let { p ->
