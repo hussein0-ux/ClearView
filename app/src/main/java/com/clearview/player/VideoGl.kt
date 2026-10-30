@@ -78,6 +78,7 @@ class VideoGl(private val outSurface: Surface, private val ctx: Context) {
     private var enhW = 0
     private var enhH = 0
 
+    private var lookFrame = 0
     private class AiLoad(val path: String, val up: NpuUpscaler?, val err: Throwable?)
     @Volatile private var pendingLoad: AiLoad? = null
     private var loadingPath: String? = null
@@ -379,6 +380,10 @@ class VideoGl(private val outSurface: Surface, private val ctx: Context) {
         GLES30.glUniform1f(loc(p, "uVibrance"), VideoLook.vibrance)
         GLES30.glUniform1f(loc(p, "uHdr"), VideoLook.hdr)
         GLES30.glUniform1f(loc(p, "uBlack"), VideoLook.blackPt)
+        GLES30.glUniform1f(loc(p, "uDeband"), VideoLook.deband)
+        GLES30.glUniform1f(loc(p, "uGrain"), VideoLook.grain)
+        lookFrame = (lookFrame + 1) % 997
+        GLES30.glUniform1f(loc(p, "uSeed"), lookFrame.toFloat())
         quad.position(0)
         GLES30.glVertexAttribPointer(0, 2, GLES30.GL_FLOAT, false, 16, quad)
         GLES30.glEnableVertexAttribArray(0)
@@ -423,6 +428,9 @@ uniform float uGrade;
 uniform float uVibrance;
 uniform float uHdr;
 uniform float uBlack;
+uniform float uDeband;
+uniform float uGrain;
+uniform float uSeed;
 uniform float uSplit;
 uniform vec4 uVp;
 
@@ -438,12 +446,42 @@ vec3 tap(vec2 off) { return texture(uTex, vUv + off * uTexel).rgb; }
 vec3 tapUv(vec2 off) { return texture(uTex, vUv + off).rgb; }
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Deband: heavily compressed video turns smooth gradients (sky, walls, out-of-focus backgrounds) into blotches and
+// steps. Average ever-wider rings of samples, but only where every sample is close to the centre colour, so slow
+// steps melt away while real edges are left alone. The sample pattern is fixed per pixel (no shimmer between frames).
+vec3 deband(vec3 c) {
+    float thr = 0.012 + 0.03 * uDeband;
+    for (int i = 0; i < 3; i++) {
+        float r = 6.0 * exp2(float(i));
+        float a = hash12(gl_FragCoord.xy + float(i) * 13.7) * 6.2831853;
+        vec2 u = vec2(cos(a), sin(a)) * r;
+        vec2 v = vec2(-u.y, u.x);
+        vec3 t0 = tap(u);
+        vec3 t1 = tap(-u);
+        vec3 t2 = tap(v);
+        vec3 t3 = tap(-v);
+        vec3 avg = (t0 + t1 + t2 + t3) * 0.25;
+        vec3 d = max(max(abs(t0 - c), abs(t1 - c)), max(abs(t2 - c), abs(t3 - c)));
+        float md = max(d.r, max(d.g, d.b));
+        c = mix(c, avg, 1.0 - smoothstep(thr * 0.6, thr, md));
+    }
+    // Tiny dither so the smoothed gradient does not re-quantise into new steps.
+    return c + (hash12(gl_FragCoord.xy + uSeed * 1.37) - 0.5) * (1.5 / 255.0);
+}
+
 void main() {
     vec3 raw = tap(vec2(0.0));
     if (uSplit > 0.5 && (gl_FragCoord.x - uVp.x) / uVp.z > 0.5) {
         outColor = vec4(raw, 1.0);
         return;
     }
+    if (uDeband > 0.001) raw = deband(raw);
 
     // Clean: edge-preserving smoothing. Neighbours that look alike are averaged (softens compression blocks
     // and noise); neighbours that differ a lot (real edges) get almost no weight and stay sharp.
@@ -516,6 +554,13 @@ void main() {
     // Deeper blacks.
     float bp = uBlack * 0.07;
     col = max(col - bp, 0.0) / (1.0 - bp);
+
+    // Fine film grain (triangular noise, moving every frame), weaker in highlights.
+    if (uGrain > 0.001) {
+        vec2 gp = floor(gl_FragCoord.xy * 0.75);
+        float g = hash12(gp + uSeed * 7.31) + hash12(gp + 19.19 + uSeed * 3.17) - 1.0;
+        col += g * uGrain * 0.09 * (1.0 - 0.6 * luma(col));
+    }
 
     outColor = vec4(clamp(col, 0.0, 1.0), 1.0);
 }

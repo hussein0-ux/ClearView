@@ -289,8 +289,9 @@ class PlayerActivity : ComponentActivity() {
 
         col.addView(label("Picture style"))
         val presets = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        fun preset(name: String, p: VideoLook.Preset) {
-            presets.addView(button(name) {
+        val presets2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun preset(name: String, p: VideoLook.Preset, row: LinearLayout = presets) {
+            row.addView(button(name) {
                 VideoLook.apply(p)
                 refreshers.forEach { it() }
                 gl?.requestRedraw()
@@ -301,8 +302,12 @@ class PlayerActivity : ComponentActivity() {
         preset("Crisp", VideoLook.CRISP)
         preset("HDR", VideoLook.HDR)
         preset("Cinema", VideoLook.CINEMA)
+        preset("Premium", VideoLook.PREMIUM, presets2)
         col.addView(presets)
+        col.addView(presets2)
 
+        slider(col, "Deband (smooth gradients)", 0f, 1f, { VideoLook.deband }) { VideoLook.deband = it }
+        slider(col, "Film grain", 0f, 1f, { VideoLook.grain }) { VideoLook.grain = it }
         slider(col, "Clean (blocks and noise)", 0f, 1f, { VideoLook.clean }) { VideoLook.clean = it }
         slider(col, "Sharpen", 0f, 1f, { VideoLook.sharpen }) { VideoLook.sharpen = it }
         slider(col, "Clarity", 0f, 1f, { VideoLook.clarity }) { VideoLook.clarity = it }
