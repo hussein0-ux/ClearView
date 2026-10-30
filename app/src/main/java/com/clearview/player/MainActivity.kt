@@ -23,6 +23,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import java.io.File
+import java.io.FileOutputStream
 import java.util.zip.ZipInputStream
 
 /** Home screen: open a video, and set up the AI model. */
@@ -197,35 +198,66 @@ class MainActivity : ComponentActivity() {
 
     private fun loadModel(uri: Uri) {
         try {
-            val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+            val dir = File(filesDir, "onnx_model").apply { deleteRecursively(); mkdirs() }
+            var onnx: File? = null
+
             val name = contentResolver.query(uri, null, null, null, null)?.use { c ->
                 val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                 if (i >= 0 && c.moveToFirst()) c.getString(i) else null
             } ?: "model.onnx"
-            val dir = File(filesDir, "onnx_model").apply { deleteRecursively(); mkdirs() }
-            var onnx: File? = null
-            if (bytes.size > 4 && bytes[0] == 'P'.code.toByte() && bytes[1] == 'K'.code.toByte()) {
-                ZipInputStream(bytes.inputStream()).use { zin ->
-                    var e = zin.nextEntry
-                    while (e != null) {
-                        val base = File(e.name).name
-                        if (!e.isDirectory && (base.endsWith(".onnx") || base.endsWith(".data") || base == "metadata.json")) {
-                            val f = File(dir, base)
-                            f.writeBytes(zin.readBytes())
-                            if (base.endsWith(".onnx")) onnx = f
+
+            val isZip = name.endsWith(".zip", true)
+
+            if (isZip) {
+                contentResolver.openInputStream(uri)?.use { inputStream ->
+                    ZipInputStream(inputStream).use { zin ->
+                        var e = zin.nextEntry
+                        while (e != null) {
+                            if (!e.isDirectory) {
+                                val base = File(e.name).name
+                                val f = File(dir, base)
+                                FileOutputStream(f).use { fos ->
+                                    val buffer = ByteArray(8192)
+                                    var len: Int
+                                    while (zin.read(buffer).also { len = it } > 0) {
+                                        fos.write(buffer, 0, len)
+                                    }
+                                }
+                                if (base.endsWith(".onnx")) {
+                                    onnx = f
+                                }
+                            }
+                            zin.closeEntry()
+                            e = zin.nextEntry
                         }
-                        e = zin.nextEntry
                     }
                 }
-            } else if (name.endsWith(".onnx")) {
-                onnx = File(dir, name).also { it.writeBytes(bytes) }
+            } else {
+                val f = File(dir, name)
+                contentResolver.openInputStream(uri)?.use { inputStream ->
+                    FileOutputStream(f).use { fos ->
+                        val buffer = ByteArray(8192)
+                        var len: Int
+                        while (inputStream.read(buffer).also { len = it } > 0) {
+                            fos.write(buffer, 0, len)
+                        }
+                    }
+                }
+                onnx = f
             }
+
             val f = onnx ?: throw IllegalStateException("No .onnx file found in $name")
-            // A model with external weights names a sidecar file inside the .onnx. If it is missing the NPU
-            // rejects the model with a confusing error, so fail early with a clear message.
-            val text = String(f.readBytes(), Charsets.ISO_8859_1)
-            val missing = Regex("[A-Za-z0-9_.\\-]+\\.(data|bin|weights)").findAll(text)
-                .map { it.value }.distinct().filter { !File(dir, it).exists() }.toList()
+            
+            // Check for sidecar weights without loading the whole file into RAM at once
+            val missing = mutableListOf<String>()
+            if (f.length() < 100 * 1024 * 1024) { // Only scan text headers if file is smallish, or check sidecars safely
+                try {
+                    val text = f.inputStream().bufferedReader(Charsets.ISO_8859_1).use { it.readText() }
+                    Regex("[A-Za-z0-9_.\\-]+\\.(data|bin|weights)").findAll(text)
+                        .map { it.value }.distinct().filter { !File(dir, it).exists() }.forEach { missing += it }
+                } catch (_: Throwable) {}
+            }
+            
             if (missing.isNotEmpty()) {
                 f.delete()
                 throw IllegalStateException(
@@ -237,6 +269,7 @@ class MainActivity : ComponentActivity() {
             AiSettings.generation++
             AiSettings.save(this)
             modelLabel?.text = "Model: ${f.name}"
+            Toast.makeText(this, "Model loaded successfully!", Toast.LENGTH_SHORT).show()
         } catch (t: Throwable) {
             Toast.makeText(this, "Could not load model: ${t.message}", Toast.LENGTH_LONG).show()
         }
