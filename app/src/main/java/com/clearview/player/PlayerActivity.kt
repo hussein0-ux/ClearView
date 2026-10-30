@@ -73,8 +73,7 @@ class PlayerActivity : ComponentActivity() {
             }
             if (showStats) {
                 val st = AiSettings.stats
-                statsText.text = AiSettings.status + if (st.isNotEmpty()) "
-$st" else ""
+                statsText.text = AiSettings.status + if (st.isNotEmpty()) "\n$st" else ""
             }
             ui.postDelayed(this, 400)
         }
