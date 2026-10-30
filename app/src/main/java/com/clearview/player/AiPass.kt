@@ -5,6 +5,7 @@ import android.opengl.GLES30
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.nio.ShortBuffer
 import java.util.Locale
 
 internal fun buildGlProgram(vs: String, fs: String): Int {
@@ -58,6 +59,9 @@ class AiPass(private val up: NpuUpscaler, val cols: Int, val rows: Int) {
     private var uQuant = 0
     private var uOutScale = 0
     private var uOutZero = 0
+    private var uOes = 0
+    private var uPresMatrix = 0
+    private var uResid = 0
 
     private val rgbaBuf: ByteBuffer = ByteBuffer.allocateDirect(lowW * lowH * 4).order(ByteOrder.nativeOrder())
     private val rgba = ByteArray(lowW * lowH * 4)
@@ -72,6 +76,15 @@ class AiPass(private val up: NpuUpscaler, val cols: Int, val rows: Int) {
     private val tileInU8: ByteBuffer =
         ByteBuffer.allocateDirect(tileBytes.size).order(ByteOrder.nativeOrder())
     private var scratchU8: ByteBuffer? = null
+
+    // uint16 (w8a16) models: quantised shorts in, quantised shorts out. Dequantised on the CPU into floats,
+    // then uploaded through the normal float path (the shader is not involved).
+    private val wide = up.wide
+    private val tileShorts = ShortArray(if (wide) 3 * up.inW * up.inH else 0)
+    private val tileInS: ShortBuffer =
+        ByteBuffer.allocateDirect(tileShorts.size * 2).order(ByteOrder.nativeOrder()).asShortBuffer()
+    private val deqBuf: FloatBuffer =
+        ByteBuffer.allocateDirect(if (wide) 3 * up.outW * up.outH * 4 else 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
 
     // Rolling stats, published every STATS_EVERY frames.
     private var frames = 0
@@ -139,6 +152,9 @@ class AiPass(private val up: NpuUpscaler, val cols: Int, val rows: Int) {
         uQuant = GLES30.glGetUniformLocation(presentProg, "uQuant")
         uOutScale = GLES30.glGetUniformLocation(presentProg, "uOutScale")
         uOutZero = GLES30.glGetUniformLocation(presentProg, "uOutZero")
+        uOes = GLES30.glGetUniformLocation(presentProg, "uOes")
+        uPresMatrix = GLES30.glGetUniformLocation(presentProg, "uStMatrix")
+        uResid = GLES30.glGetUniformLocation(presentProg, "uResid")
     }
 
     fun release() {
@@ -189,7 +205,11 @@ class AiPass(private val up: NpuUpscaler, val cols: Int, val rows: Int) {
         for (ty in 0 until rows) for (tx in 0 until cols) {
             val c0 = System.nanoTime()
             fillTile(tx, ty)
-            if (q) {
+            if (wide) {
+                tileInS.clear()
+                tileInS.put(tileShorts)
+                tileInS.rewind()
+            } else if (q) {
                 tileInU8.clear()
                 tileInU8.put(tileBytes)
                 tileInU8.rewind()
@@ -202,7 +222,13 @@ class AiPass(private val up: NpuUpscaler, val cols: Int, val rows: Int) {
             conv += c1 - c0
             var cbStart = 0L
             var cbEnd = 0L
-            if (q) {
+            if (wide) {
+                up.inferU16(tileInS) { out ->
+                    cbStart = System.nanoTime()
+                    uploadU16(out, tx, ty)
+                    cbEnd = System.nanoTime()
+                }
+            } else if (q) {
                 up.inferU8(tileInU8) { out ->
                     cbStart = System.nanoTime()
                     uploadU8(out, tx, ty)
@@ -228,8 +254,14 @@ class AiPass(private val up: NpuUpscaler, val cols: Int, val rows: Int) {
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, atlas)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, lowTex)
+        // The native-resolution video frame: same-size models add their correction to it (see PRESENT_FS).
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
+        GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex)
         GLES30.glUniform1i(uAtlas, 0)
         GLES30.glUniform1i(uLow, 1)
+        GLES30.glUniform1i(uOes, 2)
+        GLES30.glUniformMatrix4fv(uPresMatrix, 1, false, stMatrix, 0)
+        GLES30.glUniform1i(uResid, if (up.sameSize) 1 else 0)
         GLES30.glUniform2i(uTileOut, up.outW, up.outH)
         GLES30.glUniform2i(uFull, fullW, fullH)
         GLES30.glUniform1i(uPlanar, if (up.planarOut) 1 else 0)
@@ -273,6 +305,7 @@ class AiPass(private val up: NpuUpscaler, val cols: Int, val rows: Int) {
      * top row first, as the model expects.
      */
     private fun fillTile(tx: Int, ty: Int) {
+        if (wide) { fillTileU16(tx, ty); return }
         if (q) { fillTileU8(tx, ty); return }
         val w = up.inW
         val h = up.inH
@@ -327,6 +360,46 @@ class AiPass(private val up: NpuUpscaler, val cols: Int, val rows: Int) {
                 p += 4
             }
         }
+    }
+
+    private fun fillTileU16(tx: Int, ty: Int) {
+        val w = up.inW
+        val h = up.inH
+        val plane = w * h
+        val lut = up.inLut16
+        for (y in 0 until h) {
+            val srcRow = (lowH - 1) - (ty * h + y) // GL rows run bottom to top
+            var p = (srcRow * lowW + tx * w) * 4
+            for (x in 0 until w) {
+                val r = lut[rgba[p].toInt() and 0xFF]
+                val g = lut[rgba[p + 1].toInt() and 0xFF]
+                val b = lut[rgba[p + 2].toInt() and 0xFF]
+                if (up.nchwIn) {
+                    val i = y * w + x
+                    tileShorts[i] = r
+                    tileShorts[plane + i] = g
+                    tileShorts[2 * plane + i] = b
+                } else {
+                    val i = (y * w + x) * 3
+                    tileShorts[i] = r
+                    tileShorts[i + 1] = g
+                    tileShorts[i + 2] = b
+                }
+                p += 4
+            }
+        }
+    }
+
+    private fun uploadU16(out: ShortBuffer, tx: Int, ty: Int) {
+        val src = out.duplicate()
+        val n = src.remaining()
+        val base = src.position()
+        val s = up.outScale
+        val z = up.outZero
+        deqBuf.clear()
+        for (i in 0 until n) deqBuf.put(((src.get(base + i).toInt() and 0xFFFF) - z) * s)
+        deqBuf.flip()
+        upload(deqBuf, tx, ty) // float path: R32F atlas, uQuant stays 0
     }
 
     private fun uploadU8(out: ByteBuffer, tx: Int, ty: Int) {
@@ -425,11 +498,15 @@ void main() {
 """
 
         private const val PRESENT_FS = """#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
 precision highp float;
 precision highp int;
 precision highp sampler2D;
 uniform sampler2D uAtlas;
 uniform sampler2D uLow;
+uniform samplerExternalOES uOes;
+uniform mat4 uStMatrix;
+uniform int uResid;
 uniform ivec2 uTileOut;
 uniform ivec2 uFull;
 uniform int uPlanar;
@@ -461,11 +538,17 @@ vec3 fetchAi(ivec2 p) {
     return vec3(deq(q.r), deq(q.g), deq(q.b));
 }
 
+// The video frame at its native resolution.
+vec3 fetchOrig() {
+    return texture(uOes, (uStMatrix * vec4(vUv, 0.0, 1.0)).xy).rgb;
+}
+
 void main() {
     vec3 col;
     bool useLow = (uMode == 2) || (uMode == 1 && vUv.x > 0.5);
     if (useLow) {
-        col = texture(uLow, vUv).rgb;
+        // Same-size models: the comparison side is the full-resolution original, not the small copy.
+        col = uResid == 1 ? fetchOrig() : texture(uLow, vUv).rgb;
     } else {
         vec2 pos = vec2(vUv.x, 1.0 - vUv.y) * vec2(uFull) - 0.5;
         vec2 f = fract(pos);
@@ -475,6 +558,11 @@ void main() {
         vec3 c = fetchAi(i + ivec2(0, 1));
         vec3 d = fetchAi(i + ivec2(1, 1));
         col = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+        if (uResid == 1) {
+            // Denoise / deblur run on a downscaled copy. Keep the native-resolution frame and add only what
+            // the model changed (AI output minus its own input), so the picture is not softened to the model size.
+            col = fetchOrig() + (col - texture(uLow, vUv).rgb);
+        }
     }
     if (uMode == 1 && abs(vUv.x - 0.5) < 0.0015) col = vec3(1.0, 0.2, 0.2);
     outColor = vec4(clamp(col, 0.0, 1.0), 1.0);

@@ -198,6 +198,9 @@ class MainActivity : ComponentActivity() {
 
     private fun loadModel(uri: Uri) {
         try {
+            // Stop the GL thread using the old model before its files are deleted (it would fail with "No such file").
+            AiSettings.modelPath = null
+            AiSettings.generation++
             val dir = File(filesDir, "onnx_model").apply { deleteRecursively(); mkdirs() }
             var onnx: File? = null
 

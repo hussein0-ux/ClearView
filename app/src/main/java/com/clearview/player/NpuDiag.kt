@@ -45,10 +45,15 @@ object NpuDiag {
                 val info = session.inputInfo[name]!!.info as TensorInfo
                 var n = 1
                 for (d in info.shape) n *= d.toInt()
-                val tensor = if (info.type == OnnxJavaType.UINT8) {
-                    OnnxTensor.createTensor(env, ByteBuffer.allocateDirect(n).order(ByteOrder.nativeOrder()), info.shape, OnnxJavaType.UINT8)
-                } else {
-                    OnnxTensor.createTensor(env, ByteBuffer.allocateDirect(n * 4).order(ByteOrder.nativeOrder()).asFloatBuffer(), info.shape)
+                sb.append("Input: ").append(info.type).append(' ').append(info.shape.toList()).append('\n')
+                val tensor = when (info.type) {
+                    OnnxJavaType.UINT8 ->
+                        OnnxTensor.createTensor(env, ByteBuffer.allocateDirect(n).order(ByteOrder.nativeOrder()), info.shape, OnnxJavaType.UINT8)
+                    // ORT Java reports uint16 as INT16.
+                    OnnxJavaType.INT16 ->
+                        OnnxTensor.createTensor(env, ByteBuffer.allocateDirect(n * 2).order(ByteOrder.nativeOrder()).asShortBuffer(), info.shape)
+                    else ->
+                        OnnxTensor.createTensor(env, ByteBuffer.allocateDirect(n * 4).order(ByteOrder.nativeOrder()).asFloatBuffer(), info.shape)
                 }
                 tensor.use { t -> session.run(mapOf(name to t)).close() }
                 profilePath = session.endProfiling()

@@ -12,6 +12,7 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.nio.ShortBuffer
 
 /**
  * Runs a 4x super-resolution ONNX model on the Snapdragon NPU (QNN/HTP).
@@ -43,6 +44,11 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, all
     val planarOut: Boolean
     /** True for uint8 models: use [inferU8] instead of [infer]. */
     val quantized: Boolean
+    /** True for uint16 models (AI Hub w8a16): use [inferU16]. ORT Java reports uint16 as INT16. */
+    val wide: Boolean
+    /** Same-size model (denoise / deblur) rather than a 4x upscaler. */
+    val sameSize: Boolean
+    val inLut16 = ShortArray(256)
     val inScale: Float
     val inZero: Int
     val outScale: Float
@@ -56,6 +62,7 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, all
     @Volatile private var closed = false
     private val scratch: FloatBuffer?
     private val scratchU8: ByteBuffer?
+    private val scratchS: ShortBuffer?
     private val cachedInputTensor: OnnxTensor
 
     init {
@@ -111,6 +118,9 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, all
                 break
             } catch (t: Throwable) {
                 errs += "try $attempt: ${t.message?.take(160)}"
+                // A missing file or a node the NPU refuses will fail the same way every time.
+                val permanent = t.message?.let { "NO_SUCHFILE" in it || "not selected" in it } == true
+                if (permanent) break
                 if (attempt < MAX_ATTEMPTS && !allowCpu) Thread.sleep(500L * attempt)
             }
         }
@@ -132,10 +142,12 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, all
 
             val isFloat = ii.type == OnnxJavaType.FLOAT && oi.type == OnnxJavaType.FLOAT
             val isU8 = ii.type == OnnxJavaType.UINT8 && oi.type == OnnxJavaType.UINT8
-            require(isFloat || isU8) {
-                "Model must have float32 or uint8 input and output (found ${ii.type} / ${oi.type})"
+            val isU16 = ii.type == OnnxJavaType.INT16 && oi.type == OnnxJavaType.INT16
+            require(isFloat || isU8 || isU16) {
+                "Model must have float32, uint8 or uint16 input and output (found ${ii.type} / ${oi.type})"
             }
             quantized = isU8
+            wide = isU16
             require(ii.shape.size == 4 && oi.shape.size == 4) {
                 "Model input/output must be rank 4 (in ${ii.shape.toList()}, out ${oi.shape.toList()})"
             }
@@ -147,7 +159,7 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, all
             val i2 = positiveInt(ii.shape[2], "input dim 2")
             val i3 = positiveInt(ii.shape[3], "input dim 3")
             val inElements = Math.multiplyExact(Math.multiplyExact(i1, i2), i3)
-            val inByteSize = Math.multiplyExact(inElements, if (quantized) 1 else 4)
+            val inByteSize = Math.multiplyExact(inElements, if (quantized) 1 else if (wide) 2 else 4)
 
             val o1 = positiveInt(oi.shape[1], "output dim 1")
             val o2 = positiveInt(oi.shape[2], "output dim 2")
@@ -165,9 +177,24 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, all
             planarOut = b[0] == 1
             outW = b[1]
             outH = b[2]
+            sameSize = outW == inW && outH == inH
 
             val bb = ByteBuffer.allocateDirect(inByteSize).order(ByteOrder.nativeOrder())
-            if (quantized) {
+            if (wide) {
+                val q = readQuantization(modelPath, session.inputNames.first(), session.outputNames.first())
+                inScale = q[0]; inZero = q[1].toInt(); outScale = q[2]; outZero = q[3].toInt()
+                for (v in 0..255) {
+                    inLut16[v] = (Math.round((v / 255f) / inScale) + inZero).coerceIn(0, 65535).toShort()
+                    inLut[v] = 0
+                }
+                scratch = null
+                scratchU8 = null
+                val sb = bb.asShortBuffer()
+                scratchS = sb
+                require(sb.capacity() == inElements) { "Scratch buffer capacity mismatch" }
+                createdTensor = OnnxTensor.createTensor(env, sb, inShape)
+            } else if (quantized) {
+                scratchS = null
                 val q = readQuantization(modelPath, session.inputNames.first(), session.outputNames.first())
                 inScale = q[0]; inZero = q[1].toInt(); outScale = q[2]; outZero = q[3].toInt()
                 for (v in 0..255) {
@@ -179,6 +206,7 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, all
                 require(bb.capacity() == inElements) { "Scratch buffer capacity mismatch" }
                 createdTensor = OnnxTensor.createTensor(env, bb, inShape, OnnxJavaType.UINT8)
             } else {
+                scratchS = null
                 inScale = 1f; inZero = 0; outScale = 1f; outZero = 0
                 for (v in 0..255) inLut[v] = v.toByte()
                 val fb = bb.asFloatBuffer()
@@ -198,12 +226,12 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, all
     }
 
     fun describe() = "in ${inW}x$inH -> out ${outW}x$outH (${if (nchwIn) "NCHW" else "NHWC"} in, " +
-        "${if (planarOut) "NCHW" else "NHWC"} out, ${if (quantized) "uint8" else "float32"}), $note"
+        "${if (planarOut) "NCHW" else "NHWC"} out, ${if (quantized) "uint8" else if (wide) "uint16" else "float32"}), $note"
 
     /** Float models. [consume] sees the output only while it runs; do not keep the buffer. */
     fun infer(input: FloatBuffer, consume: (FloatBuffer) -> Unit): Unit = synchronized(inputLock) {
         check(!closed) { "NpuUpscaler is closed" }
-        check(!quantized) { "Model is uint8; call inferU8" }
+        check(!quantized && !wide) { "Model is quantised; call inferU8 / inferU16" }
         val fb = scratch!!
         val dup = input.duplicate()
         val rem = dup.remaining()
@@ -227,7 +255,7 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, all
      */
     fun inferU8(input: ByteBuffer, consume: (ByteBuffer) -> Unit): Unit = synchronized(inputLock) {
         check(!closed) { "NpuUpscaler is closed" }
-        check(quantized) { "Model is float32; call infer" }
+        check(quantized) { "Model is not uint8; call infer or inferU16" }
         val bb = scratchU8!!
         val dup = input.duplicate()
         val rem = dup.remaining()
@@ -241,6 +269,24 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, all
 
         session.run(mapOf(inName to cachedInputTensor)).use { results ->
             consume((results[0] as OnnxTensor).byteBuffer)
+        }
+    }
+
+    /** uint16 models. [input] holds quantised values (raw pixels mapped through [inLut16]). */
+    fun inferU16(input: ShortBuffer, consume: (ShortBuffer) -> Unit): Unit = synchronized(inputLock) {
+        check(!closed) { "NpuUpscaler is closed" }
+        check(wide) { "Model is not uint16" }
+        val sb = scratchS!!
+        val dup = input.duplicate()
+        require(dup.remaining() == sb.capacity()) {
+            "Tile size mismatch: expected ${sb.capacity()} shorts, got ${dup.remaining()}"
+        }
+        sb.clear()
+        sb.put(dup)
+        sb.rewind()
+
+        session.run(mapOf(inName to cachedInputTensor)).use { results ->
+            consume((results[0] as OnnxTensor).shortBuffer)
         }
     }
 

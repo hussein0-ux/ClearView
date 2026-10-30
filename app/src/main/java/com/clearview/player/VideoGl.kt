@@ -78,6 +78,9 @@ class VideoGl(private val outSurface: Surface, private val ctx: Context) {
     private var enhW = 0
     private var enhH = 0
 
+    private class AiLoad(val path: String, val up: NpuUpscaler?, val err: Throwable?)
+    @Volatile private var pendingLoad: AiLoad? = null
+    private var loadingPath: String? = null
     private var upscaler: NpuUpscaler? = null
     private var upscalerPath: String? = null
     private var ai: AiPass? = null
@@ -273,22 +276,61 @@ class VideoGl(private val outSurface: Surface, private val ctx: Context) {
         }
         if (path == aiFailedPath) return false
         try {
+            // The model loads on its own thread (compiling a big model takes many seconds); the video keeps
+            // playing with the plain filters until it is ready.
+            pendingLoad?.let { l ->
+                pendingLoad = null
+                loadingPath = null
+                if (l.path != path) {
+                    runCatching { l.up?.close() }
+                } else if (l.err != null) {
+                    throw l.err
+                } else {
+                    ai?.release(); ai = null
+                    upscaler?.close()
+                    upscaler = l.up
+                    upscalerPath = l.path
+                    AiSettings.status = "AI running: " + l.up!!.describe()
+                    Log.i(TAG, AiSettings.status)
+                }
+            }
             if (upscaler == null || upscalerPath != path) {
-                ai?.release(); ai = null
-                upscaler?.close(); upscaler = null
-                AiSettings.status = "AI: loading model on the NPU..."
-                val up = NpuUpscaler(path, AiSettings.nativeLibDir, ctx.cacheDir.absolutePath, AiSettings.allowCpu)
-                upscaler = up
-                upscalerPath = path
-                AiSettings.status = "AI running: " + up.describe()
-                Log.i(TAG, AiSettings.status)
+                if (loadingPath != path) {
+                    loadingPath = path
+                    ai?.release(); ai = null
+                    upscaler?.close(); upscaler = null
+                    AiSettings.status = "AI: loading model on the NPU (video plays with filters meanwhile)..."
+                    val nativeDir = AiSettings.nativeLibDir
+                    val cacheDir = ctx.cacheDir.absolutePath
+                    val allowCpu = AiSettings.allowCpu
+                    Thread({
+                        pendingLoad = try {
+                            AiLoad(path, NpuUpscaler(path, nativeDir, cacheDir, allowCpu), null)
+                        } catch (t: Throwable) {
+                            AiLoad(path, null, t)
+                        }
+                    }, "ai-load").start()
+                }
+                return false
             }
             val up = upscaler!!
-            // Grid in 128 px units: k rows, and as many columns as the video's shape needs.
-            val k = when (AiSettings.quality) { 0 -> 2; 1 -> 3; else -> 6 }
-            val unitsW = max(1, (k * aspect).roundToInt())
-            val c = max(1, unitsW * 128 / up.inW)
-            val r = max(1, k * 128 / up.inH)
+            val c: Int
+            val r: Int
+            if (up.sameSize) {
+                // Denoise / deblur: the model works on tiles of its own size. Pick a grid of tiles that matches the
+                // video's shape, with a working height of 360 / 720 / 1080 px for quality Low / Medium / High.
+                // The result is added to the native-resolution frame in the shader, so the picture stays sharp on
+                // a 3120x1440 screen even when the working copy is smaller.
+                val workH = when (AiSettings.quality) { 0 -> 360f; 1 -> 720f; else -> 1080f }
+                r = max(1, (workH / up.inH).roundToInt())
+                c = max(1, (r * up.inH * aspect / up.inW).roundToInt())
+            } else {
+                // Grid in 128 px units: k rows, and as many columns as the video's shape needs.
+                val k = when (AiSettings.quality) { 0 -> 2; 1 -> 3; else -> 6 }
+                val unitsW = max(1, (k * aspect).roundToInt())
+                c = max(1, unitsW * 128 / up.inW)
+                r = max(1, k * 128 / up.inH)
+            }
             var pass = ai
             if (pass == null || pass.cols != c || pass.rows != r) {
                 pass?.release()
