@@ -284,7 +284,7 @@ class VideoGl(private val outSurface: Surface) {
             }
             val up = upscaler!!
             // Grid in 128 px units: k rows, and as many columns as the video's shape needs.
-            val k = when (AiSettings.quality) { 0 -> 2; 1 -> 3; else -> 12 }
+            val k = when (AiSettings.quality) { 0 -> 2; 1 -> 3; else -> 6 }
             val unitsW = max(1, (k * aspect).roundToInt())
             val c = max(1, unitsW * 128 / up.inW)
             val r = max(1, k * 128 / up.inH)
