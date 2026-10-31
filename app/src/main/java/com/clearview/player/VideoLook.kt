@@ -15,6 +15,10 @@ object VideoLook {
     @Volatile var blackPt = 0.10f     // 0..1    deeper blacks
     @Volatile var deband = 0.70f      // 0..1    smooths banding / compression blotches in gradients (sky, walls)
     @Volatile var grain = 0.30f       // 0..1    fine film grain: hides smearing and gives a filmic finish
+    /** Sharp scaling: Catmull-Rom bicubic instead of plain bilinear when the video is scaled up to the screen. */
+    @Volatile var bicubic = true
+    /** Held while the finger is down after a long press: shows the untouched original (A/B reality check). */
+    @Volatile var bypass = false
     /** Compare mode: enhanced on the left half, untouched on the right half. */
     @Volatile var compare = false
 

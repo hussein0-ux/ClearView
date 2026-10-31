@@ -71,9 +71,10 @@ class PlayerActivity : ComponentActivity() {
                 timeText.text = fmt(p.currentPosition) + " / " + (if (dur == C.TIME_UNSET) "--:--" else fmt(dur))
                 playBtn.text = if (p.isPlaying) "Pause" else "Play"
             }
+            runCatching { ThermalGuard.update(this@PlayerActivity) }
             if (showStats) {
                 val st = AiSettings.stats
-                statsText.text = AiSettings.status + if (st.isNotEmpty()) "\n$st" else ""
+                statsText.text = AiSettings.status + (if (st.isNotEmpty()) "\n$st" else "") + "\n" + ThermalGuard.summary()
             }
             ui.postDelayed(this, 400)
         }
@@ -151,6 +152,12 @@ class PlayerActivity : ComponentActivity() {
                 return true
             }
 
+            // A/B reality check: hold a long press to see the untouched original, let go to snap back.
+            override fun onLongPress(e: MotionEvent) {
+                VideoLook.bypass = true
+                gl?.requestRedraw()
+            }
+
             override fun onDoubleTap(e: MotionEvent): Boolean {
                 val p = player ?: return true
                 val delta = if (e.x < root.width / 2f) -10_000L else 10_000L
@@ -158,7 +165,14 @@ class PlayerActivity : ComponentActivity() {
                 return true
             }
         })
-        surface.setOnTouchListener { _, ev -> detector.onTouchEvent(ev); true }
+        surface.setOnTouchListener { _, ev ->
+            detector.onTouchEvent(ev)
+            if ((ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) && VideoLook.bypass) {
+                VideoLook.bypass = false
+                gl?.requestRedraw()
+            }
+            true
+        }
 
         // Top bar
         topBar = LinearLayout(this).apply {
@@ -316,6 +330,16 @@ class PlayerActivity : ComponentActivity() {
         slider(col, "Saturation", 0.5f, 1.6f, { VideoLook.saturation }) { VideoLook.saturation = it }
         slider(col, "Brightness", 0.8f, 1.4f, { VideoLook.exposure }) { VideoLook.exposure = it }
 
+        col.addView(CheckBox(this).apply {
+            text = "Sharp scaling (bicubic)"
+            setTextColor(Color.WHITE)
+            isChecked = VideoLook.bicubic
+            setOnCheckedChangeListener { _, on ->
+                VideoLook.bicubic = on
+                gl?.requestRedraw()
+            }
+        })
+        col.addView(label("Tip: press and hold the picture to see the original"))
         col.addView(CheckBox(this).apply {
             text = "Compare: enhanced on the left, original on the right"
             setTextColor(Color.WHITE)

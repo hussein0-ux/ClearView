@@ -14,6 +14,8 @@ object AiSettings {
     @Volatile var viewMode = 0
     /** Bumped by the UI to make the pipeline retry after a failure. */
     @Volatile var generation = 0
+    /** Set by [ThermalGuard]: 0 normal, 1 warm (AI forced to Fast), 2 hot (AI paused). */
+    @Volatile var thermalMode = 0
     @Volatile var nativeLibDir = ""
     @Volatile var status = "AI idle"
     @Volatile var stats = ""

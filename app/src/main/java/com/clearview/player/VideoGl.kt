@@ -276,6 +276,13 @@ class VideoGl(private val outSurface: Surface, private val ctx: Context) {
             aiFailedPath = null
         }
         if (path == aiFailedPath) return false
+        if (AiSettings.thermalMode >= 2) {
+            // Too hot: pause the heavy model, keep playing with the cheap GPU filters until the phone cools.
+            AiSettings.status = "AI paused: phone is hot, using filters only"
+            return false
+        }
+        // Warm: force the smallest AI size.
+        val quality = if (AiSettings.thermalMode == 1) 0 else AiSettings.quality
         try {
             // The model loads on its own thread (compiling a big model takes many seconds); the video keeps
             // playing with the plain filters until it is ready.
@@ -322,12 +329,12 @@ class VideoGl(private val outSurface: Surface, private val ctx: Context) {
                 // video's shape, with a working height of 360 / 720 / 1080 px for quality Low / Medium / High.
                 // The result is added to the native-resolution frame in the shader, so the picture stays sharp on
                 // a 3120x1440 screen even when the working copy is smaller.
-                val workH = when (AiSettings.quality) { 0 -> 360f; 1 -> 720f; else -> 1080f }
+                val workH = when (quality) { 0 -> 360f; 1 -> 720f; else -> 1080f }
                 r = max(1, (workH / up.inH).roundToInt())
                 c = max(1, (r * up.inH * aspect / up.inW).roundToInt())
             } else {
                 // Grid in 128 px units: k rows, and as many columns as the video's shape needs.
-                val k = when (AiSettings.quality) { 0 -> 2; 1 -> 3; else -> 6 }
+                val k = when (quality) { 0 -> 2; 1 -> 3; else -> 6 }
                 val unitsW = max(1, (k * aspect).roundToInt())
                 c = max(1, unitsW * 128 / up.inW)
                 r = max(1, k * 128 / up.inH)
@@ -338,7 +345,7 @@ class VideoGl(private val outSurface: Surface, private val ctx: Context) {
                 pass = AiPass(up, c, r).also { it.init() }
                 ai = pass
             }
-            AiSettings.viewMode = if (VideoLook.compare) 1 else 0
+            AiSettings.viewMode = if (VideoLook.bypass) 2 else if (VideoLook.compare) 1 else 0
             ensureEnh(vw, vh)
             pass.render(oesTex, stMatrix, quad, enhFbo, 0, 0, vw, vh)
             return true
@@ -380,6 +387,8 @@ class VideoGl(private val outSurface: Surface, private val ctx: Context) {
         GLES30.glUniform1f(loc(p, "uVibrance"), VideoLook.vibrance)
         GLES30.glUniform1f(loc(p, "uHdr"), VideoLook.hdr)
         GLES30.glUniform1f(loc(p, "uBlack"), VideoLook.blackPt)
+        GLES30.glUniform1f(loc(p, "uBicubic"), if (oes && VideoLook.bicubic) 1f else 0f)
+        GLES30.glUniform1f(loc(p, "uBypass"), if (VideoLook.bypass) 1f else 0f)
         GLES30.glUniform1f(loc(p, "uDeband"), VideoLook.deband)
         GLES30.glUniform1f(loc(p, "uGrain"), VideoLook.grain)
         lookFrame = (lookFrame + 1) % 997
@@ -431,6 +440,8 @@ uniform float uBlack;
 uniform float uDeband;
 uniform float uGrain;
 uniform float uSeed;
+uniform float uBicubic;
+uniform float uBypass;
 uniform float uSplit;
 uniform vec4 uVp;
 
@@ -445,6 +456,35 @@ out vec4 outColor;
 vec3 tap(vec2 off) { return texture(uTex, vUv + off * uTexel).rgb; }
 vec3 tapUv(vec2 off) { return texture(uTex, vUv + off).rgb; }
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// Catmull-Rom bicubic in 9 bilinear taps. Sharper than plain bilinear when a 1080p frame is stretched to the screen,
+// without the blur that bilinear adds to compression artifacts. (A non-ML spatial upscaler, as a safe default.)
+vec3 catmull(vec2 uv) {
+    vec2 texSize = 1.0 / uTexel;
+    vec2 pos = uv * texSize;
+    vec2 c = floor(pos - 0.5) + 0.5;
+    vec2 f = pos - c;
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+    vec2 w0 = f2 - 0.5 * (f3 + f);
+    vec2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+    vec2 w3 = 0.5 * (f3 - f2);
+    vec2 w2 = 1.0 - w0 - w1 - w3;
+    vec2 w12 = w1 + w2;
+    vec2 t0 = (c - 1.0) * uTexel;
+    vec2 t3 = (c + 2.0) * uTexel;
+    vec2 t12 = (c + w2 / w12) * uTexel;
+    vec3 r = texture(uTex, vec2(t0.x, t0.y)).rgb * (w0.x * w0.y)
+           + texture(uTex, vec2(t12.x, t0.y)).rgb * (w12.x * w0.y)
+           + texture(uTex, vec2(t3.x, t0.y)).rgb * (w3.x * w0.y)
+           + texture(uTex, vec2(t0.x, t12.y)).rgb * (w0.x * w12.y)
+           + texture(uTex, vec2(t12.x, t12.y)).rgb * (w12.x * w12.y)
+           + texture(uTex, vec2(t3.x, t12.y)).rgb * (w3.x * w12.y)
+           + texture(uTex, vec2(t0.x, t3.y)).rgb * (w0.x * w3.y)
+           + texture(uTex, vec2(t12.x, t3.y)).rgb * (w12.x * w3.y)
+           + texture(uTex, vec2(t3.x, t3.y)).rgb * (w3.x * w3.y);
+    return clamp(r, 0.0, 1.0);
+}
 
 float hash12(vec2 p) {
     vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -477,10 +517,11 @@ vec3 deband(vec3 c) {
 
 void main() {
     vec3 raw = tap(vec2(0.0));
-    if (uSplit > 0.5 && (gl_FragCoord.x - uVp.x) / uVp.z > 0.5) {
+    if (uBypass > 0.5 || (uSplit > 0.5 && (gl_FragCoord.x - uVp.x) / uVp.z > 0.5)) {
         outColor = vec4(raw, 1.0);
         return;
     }
+    if (uBicubic > 0.5) raw = catmull(vUv);
     if (uDeband > 0.001) raw = deband(raw);
 
     // Clean: edge-preserving smoothing. Neighbours that look alike are averaged (softens compression blocks
