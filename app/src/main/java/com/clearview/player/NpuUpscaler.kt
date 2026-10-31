@@ -6,7 +6,9 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtLoggingLevel
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
+import android.os.Build
 import android.system.Os
+import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.nio.ByteBuffer
@@ -87,23 +89,66 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, all
 
         // NPU only. There is no CPU fallback: if any node cannot run on the NPU the session is refused.
         // Session creation occasionally fails transiently (the same model passes on another attempt), so retry.
+        // Compiled-model cache. Compiling a model for the HTP takes seconds (tens of seconds for big ones), so the
+        // first launch writes the compiled graph to a "_ctx.onnx" file and later launches load that instead.
+        // These are ONNX Runtime *session config* keys (ep.context_*); the old qnn_context_cache_* provider options
+        // are not the current mechanism. The cache is keyed on the model file, the CPU-fallback setting and the OS
+        // build; if a cached file ever fails to load it is deleted and the model is compiled again.
+        val src = File(modelPath)
+        val ctxDir = File(cacheDir, "qnn_ctx").apply { mkdirs() }
+        val tag = "${src.nameWithoutExtension}_${src.length()}_${src.lastModified()}_cpu${if (allowCpu) 1 else 0}_${Build.FINGERPRINT.hashCode()}"
+        val ctxFile = File(ctxDir, "$tag.ctx.onnx")
+        var cacheNote = ""
+        // Drop caches of other models / old versions so they do not pile up.
+        ctxDir.listFiles()?.forEach { if (it.name != ctxFile.name) it.delete() }
+
+        fun configure(o: OrtSession.SessionOptions) {
+            o.setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO)
+            o.addQnn(
+                mapOf(
+                    "backend_path" to "libQnnHtp.so",
+                    "htp_performance_mode" to "burst",
+                    "enable_htp_fp16_precision" to "1",
+                )
+            )
+            if (!allowCpu) o.addConfigEntry("session.disable_cpu_ep_fallback", "1")
+        }
+
         fun open(): Pair<OrtSession, OrtSession.SessionOptions> {
+            // 1. A previously compiled model: no compilation, so this is fast.
+            if (ctxFile.length() > 0) {
+                val o = OrtSession.SessionOptions()
+                try {
+                    configure(o)
+                    val s = env.createSession(ctxFile.path, o)
+                    cacheNote = "compiled model loaded from cache"
+                    return s to o
+                } catch (t: Throwable) {
+                    o.close()
+                    Log.w("NpuUpscaler", "Cached model unusable, recompiling: ${t.message}")
+                    ctxFile.delete()
+                }
+            }
+            // 2. Compile from the original model and write the cache (to a temp name, renamed once complete).
+            val tmp = File(ctxDir, "$tag.tmp.ctx.onnx")
+            tmp.delete()
             val o = OrtSession.SessionOptions()
             try {
-                o.setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO)
-                o.addQnn(
-                    mapOf(
-                        "backend_path" to "libQnnHtp.so",
-                        "htp_performance_mode" to "burst",
-                        "enable_htp_fp16_precision" to "1",
-                        "qnn_context_cache_enable" to "1",
-                        "qnn_context_cache_path" to "$cacheDir/model_cache.bin"
-                    )
-                )
-                if (!allowCpu) o.addConfigEntry("session.disable_cpu_ep_fallback", "1")
-                return env.createSession(modelPath, o) to o
+                configure(o)
+                o.addConfigEntry("ep.context_enable", "1")
+                o.addConfigEntry("ep.context_file_path", tmp.path)
+                o.addConfigEntry("ep.context_embed_mode", "1")
+                val s = env.createSession(modelPath, o)
+                if (tmp.length() > 0 && tmp.renameTo(ctxFile)) {
+                    cacheNote = "compiled now and cached for next time"
+                } else {
+                    tmp.delete()
+                    cacheNote = "compiled (cache file was not written)"
+                }
+                return s to o
             } catch (t: Throwable) {
                 o.close()
+                tmp.delete()
                 throw t
             }
         }
@@ -114,7 +159,8 @@ class NpuUpscaler(modelPath: String, nativeLibDir: String, cacheDir: String, all
             try {
                 pair = open()
                 val base = if (allowCpu) "QNN/HTP with CPU fallback allowed (some nodes may run on the CPU)" else "NPU only (QNN/HTP), no CPU fallback"
-                configNote = if (attempt == 1) base else "$base, needed $attempt attempts"
+                configNote = (if (attempt == 1) base else "$base, needed $attempt attempts") +
+                    if (cacheNote.isNotEmpty()) "; $cacheNote" else ""
                 break
             } catch (t: Throwable) {
                 errs += "try $attempt: ${t.message?.take(160)}"
