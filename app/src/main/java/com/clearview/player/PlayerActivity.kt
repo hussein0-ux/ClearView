@@ -84,6 +84,12 @@ class PlayerActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Draw edge to edge, including behind the camera cutout. Without this, in landscape Android keeps the window
+        // out of the cutout area and leaves a black strip beside the camera.
+        window.attributes = window.attributes.apply {
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        }
+        window.setDecorFitsSystemWindows(false)
         AiSettings.load(this)
 
         val uri = intent?.data
@@ -224,8 +230,15 @@ class PlayerActivity : ComponentActivity() {
         }
         val fillBtn = button("Fit") {
             val g = gl ?: return@button
-            g.fill = !g.fill
-            (it as Button).text = if (g.fill) "Fill" else "Fit"
+            // Fit (bars) -> Zoom (half way, small crop) -> Fill (crop to cover) -> Fit
+            g.fill = false
+            g.fillAmount = when {
+                g.fillAmount < 0.25f -> 0.5f
+                g.fillAmount < 0.75f -> 1f
+                else -> 0f
+            }
+            (it as Button).text = when { g.fillAmount >= 0.75f -> "Fill"; g.fillAmount >= 0.25f -> "Zoom"; else -> "Fit" }
+            g.requestRedraw()
             scheduleHide()
         }
         val enhanceBtn = button("Enhance") {

@@ -65,6 +65,8 @@ class VideoGl(private val outSurface: Surface, private val ctx: Context) {
     @Volatile private var aspect = 16f / 9f
     /** false = whole picture visible (black bars), true = fill the screen (crops the edges). */
     @Volatile var fill = false
+    /** 0 = Fit, 1 = Fill, in between = partial zoom (used when [fill] is false). */
+    @Volatile var fillAmount = 0f
         set(v) { field = v; requestRedraw() }
     private var hasFrame = false
 
@@ -245,14 +247,17 @@ class VideoGl(private val outSurface: Surface, private val ctx: Context) {
         // Where the picture goes on screen (letterboxed, or cropped to fill).
         val a = aspect
         val screenA = outW.toFloat() / outH
-        val widthLimited = if (fill) screenA > a else screenA <= a
-        val vw: Int
-        val vh: Int
-        if (widthLimited) {
-            vw = outW; vh = (outW / a).roundToInt()
-        } else {
-            vh = outH; vw = (outH * a).roundToInt()
-        }
+        // Fit = whole picture with bars; Fill = crop to cover the screen; anything between is a partial zoom
+        // (same aspect ratio, so the picture is never stretched).
+        val fitW: Float
+        val fitH: Float
+        val fillW: Float
+        val fillH: Float
+        if (screenA <= a) { fitW = outW.toFloat(); fitH = outW / a } else { fitH = outH.toFloat(); fitW = outH * a }
+        if (screenA > a) { fillW = outW.toFloat(); fillH = outW / a } else { fillH = outH.toFloat(); fillW = outH * a }
+        val z = (if (fill) 1f else fillAmount).coerceIn(0f, 1f)
+        val vw = (fitW + (fillW - fitW) * z).roundToInt()
+        val vh = (fitH + (fillH - fitH) * z).roundToInt()
         val vx = (outW - vw) / 2
         val vy = (outH - vh) / 2
 
